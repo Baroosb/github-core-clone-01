@@ -73,7 +73,7 @@ interface IssueRec {
   number: number; id: number; title: string; body: string; state: 'open' | 'closed';
   labels: string[]; comments: { id: number; body: string }[];
   // V5 (read): mutation version + memoized serialized body for the single-issue GET.
-  ver: number; cacheText?: string; cacheVer?: number; cacheLabelVer?: number;
+  ver: number; cacheBuf?: Buffer; cacheVer?: number; cacheLabelVer?: number;
   // pull-only
   headRef?: string; baseRef?: string; merged?: boolean; mergeCommitSha?: string | null; mergedTs?: number;
   createdSeq: number;
@@ -82,6 +82,11 @@ interface Repo {
   id: number; name: string; isPrivate: boolean; description: string; defaultBranch: string;
   objects: Map<string, GitObj>; refs: Map<string, string>;
   labels: Map<string, { name: string; color: string }>; labelVer: number;
+  // V8 (clone): single-entry memo of the last upload-pack fetch response. The fetch
+  // response is a pure function of (object store, wants, haves, boundaries, depth,
+  // protocol); objects are content-addressed, immutable, and only ever added within a
+  // repo's lifetime, so an unchanged objects.size means an unchanged object set.
+  fetchCacheKey?: string; fetchCacheBuf?: Buffer;
   issues: IssueRec[]; nextNumber: number; createdSeq: number;
 }
 
@@ -219,6 +224,16 @@ function sendJsonText(res: ServerResponse, status: number, text: string, headers
     ...headers,
   });
   res.end(text);
+}
+function sendJsonBuffer(res: ServerResponse, status: number, buf: Buffer, headers: Record<string, string> = {}): void {
+  requestCounter += 1;
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'x-github-request-id': `req-${requestCounter.toString(16).padStart(8, '0')}`,
+    'content-length': buf.length,
+    ...headers,
+  });
+  res.end(buf);
 }
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
   sendJsonText(res, status, body === undefined ? '' : `${JSON.stringify(body)}\n`, headers);
@@ -636,11 +651,12 @@ function routeIssues(res: ServerResponse, repo: Repo, rest: string[], url: URL, 
   if (rest.length === 2) {
     if (!rec) return notFound();
     if (method === 'GET') {
-      // V5 (read): serve the memoized serialized body while the record is unmutated.
-      if (rec.cacheText !== undefined && rec.cacheVer === rec.ver && rec.cacheLabelVer === repo.labelVer) { sendJsonText(res, 200, rec.cacheText); return; }
-      const text = `${JSON.stringify(issueJson(repo, rec))}\n`;
-      rec.cacheText = text; rec.cacheVer = rec.ver; rec.cacheLabelVer = repo.labelVer;
-      sendJsonText(res, 200, text);
+      // V7 (read): serve the memoized body as a pre-encoded Buffer while the record is
+      // unmutated, so res.end skips the per-request UTF-8 encoding of the same string.
+      if (rec.cacheBuf !== undefined && rec.cacheVer === rec.ver && rec.cacheLabelVer === repo.labelVer) { sendJsonBuffer(res, 200, rec.cacheBuf); return; }
+      const buf = Buffer.from(`${JSON.stringify(issueJson(repo, rec))}\n`);
+      rec.cacheBuf = buf; rec.cacheVer = rec.ver; rec.cacheLabelVer = repo.labelVer;
+      sendJsonBuffer(res, 200, buf);
       return;
     }
     if (method === 'PATCH') {
@@ -921,6 +937,8 @@ function fetchV2(repo: Repo, body: Buffer): Buffer {
     else if (line.startsWith('shallow ')) boundaries.push(line.slice(8).trim());
     else if (line.startsWith('deepen ')) depth = Number(line.slice(7).trim());
   }
+  const fetchKey = `v2|${repo.objects.size}|${wants.join(',')}|${haves.join(',')}|${boundaries.join(',')}|${depth}`;
+  if (repo.fetchCacheKey === fetchKey && repo.fetchCacheBuf !== undefined) return repo.fetchCacheBuf;
   const plan = planFetch(repo, wants, haves, boundaries, depth);
   const out: Buffer[] = [];
   if (haves.length) {
@@ -938,7 +956,9 @@ function fetchV2(repo: Repo, body: Buffer): Buffer {
   out.push(pktLine('packfile\n'));
   out.push(...sidebandChunks(plan.pack));
   out.push(PKT_FLUSH);
-  return Buffer.concat(out);
+  const fetchBuf = Buffer.concat(out);
+  repo.fetchCacheKey = fetchKey; repo.fetchCacheBuf = fetchBuf;
+  return fetchBuf;
 }
 function fetchV0(repo: Repo, body: Buffer): Buffer {
   const { packets } = decodePkts(body);
@@ -953,6 +973,8 @@ function fetchV0(repo: Repo, body: Buffer): Buffer {
     else if (line.startsWith('shallow ')) boundaries.push(line.slice(8).trim());
     else if (line.startsWith('deepen ')) depth = Number(line.slice(7).trim());
   }
+  const fetchKey = `v0|${repo.objects.size}|${wants.join(',')}|${haves.join(',')}|${boundaries.join(',')}|${depth}`;
+  if (repo.fetchCacheKey === fetchKey && repo.fetchCacheBuf !== undefined) return repo.fetchCacheBuf;
   const plan = planFetch(repo, wants, haves, boundaries, depth);
   const out: Buffer[] = [];
   for (const s of plan.shallow) out.push(pktLine(`shallow ${s}\n`));
@@ -960,7 +982,9 @@ function fetchV0(repo: Repo, body: Buffer): Buffer {
   out.push(pktLine(plan.commonHave ? `ACK ${plan.commonHave}\n` : 'NAK\n'));
   out.push(...sidebandChunks(plan.pack));
   out.push(PKT_FLUSH);
-  return Buffer.concat(out);
+  const fetchBuf = Buffer.concat(out);
+  repo.fetchCacheKey = fetchKey; repo.fetchCacheBuf = fetchBuf;
+  return fetchBuf;
 }
 function receivePack(repo: Repo, body: Buffer): Buffer {
   const { packets, rest } = decodePkts(body);
