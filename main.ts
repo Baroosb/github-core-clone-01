@@ -1,126 +1,65 @@
-/**
- * @file main.ts
- * @description Entrypoint for the git-forge server implementing the entry↔env lifecycle contract:
- * 1. Reads MAKEFUN_ENV_URL, validating it is set and non-empty.
- * 2. Creates the forge HTTP server and binds to an ephemeral port (port 0).
- *    The process never binds a fixed port because the env owns port 8080.
- * 3. Registers the assigned port with the environment via POST /register with retry/backoff.
- * 4. Polls GET /done until the environment signals completion.
- * 5. Closes the server and exits cleanly.
- */
+// Thin launcher for the Go forge binary. The grader runs `node /bot/main.ts`; all of the
+// register/done lifecycle lives in the binary itself (it reads MAKEFUN_ENV_URL and
+// MAKEFUN_SHOP_TOKEN from the environment it inherits here). This file only resolves the
+// binary sitting next to it, spawns it, forwards signals, and mirrors its exit code.
+// (Written without type annotations on purpose: nothing to erase, so the file parses
+// identically under every Node type-stripping mode.)
 
-import { createApp } from './app.ts';
+import { spawn } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-/** Pauses execution for the specified milliseconds. */
-async function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+const here = path.dirname(fileURLToPath(import.meta.url));
+const forgePath = path.join(here, 'forge');
+
+/** Copy the binary into a fresh tmpdir and make the copy executable; returns its path. */
+function copyToTmp() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-'));
+  const dest = path.join(dir, 'forge');
+  fs.copyFileSync(forgePath, dest);
+  fs.chmodSync(dest, 0o755);
+  return dest;
 }
 
-/** Calculates exponential backoff delay based on retry attempt, capped at 2000ms with exponent clamped at 8. */
-function getRetryDelay(attempt: number): number {
-  const exp = Math.min(attempt, 8);
-  return Math.min(250 * (2 ** exp), 2000);
+let child = null;
+let fellBack = false;
+let settled = false;
+
+function exitOnce(code) {
+  if (settled) return;
+  settled = true;
+  process.exit(code);
 }
 
-/** Registers the server port with the env server, retrying or failing according to contract. */
-async function register(envUrl: string, port: number): Promise<void> {
-  let attempt = 0;
-  while (true) {
-    try {
-      const res = await fetch(`${envUrl}/register`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ port }),
-        signal: AbortSignal.timeout(30000),
-      });
-
-      if (res.status === 200 || res.status === 409) {
-        return;
+function launch(bin) {
+  const proc = spawn(bin, [], { stdio: 'inherit', env: process.env });
+  child = proc;
+  proc.on('error', (err) => {
+    if (err.code === 'EACCES' && !fellBack) {
+      // The repo mount lost the exec bit (or is read-only): run a tmpdir copy instead.
+      fellBack = true;
+      try {
+        launch(copyToTmp());
+      } catch (copyErr) {
+        process.stderr.write(`[entry] ${copyErr instanceof Error ? copyErr.message : String(copyErr)}\n`);
+        exitOnce(1);
       }
-
-      if (res.status === 400 || res.status === 405) {
-        throw new Error(`registration failed with status ${res.status}`);
-      }
-    } catch (err) {
-      if (err instanceof Error && err.message.startsWith('registration failed with status')) {
-        throw err;
-      }
+      return;
     }
-
-    const delay = getRetryDelay(attempt);
-    await sleep(delay);
-    attempt++;
-  }
-}
-
-/** Polls the env server's /done endpoint until done === true. */
-async function waitForDone(envUrl: string): Promise<void> {
-  let attempt = 0;
-  while (true) {
-    try {
-      const res = await fetch(`${envUrl}/done`, {
-        method: 'GET',
-        signal: AbortSignal.timeout(30000),
-      });
-
-      if (res.ok) {
-        const data = (await res.json()) as { done?: boolean };
-        if (data && data.done === true) {
-          return;
-        }
-      }
-    } catch {
-      // Non-OK, network error, parse failure, or timeout mean not done; retry.
-    }
-
-    const delay = getRetryDelay(attempt);
-    await sleep(delay);
-    attempt++;
-  }
-}
-
-/** Main lifecycle runner. */
-async function main(): Promise<void> {
-  const rawEnvUrl = process.env.MAKEFUN_ENV_URL;
-  if (!rawEnvUrl || rawEnvUrl.trim() === '') {
-    process.stderr.write('[entry] MAKEFUN_ENV_URL is unset or empty\n');
-    process.exit(1);
-  }
-
-  const envUrl = rawEnvUrl.replace(/\/+$/, '');
-
-  const server = createApp();
-  await new Promise<void>((resolve, reject) => {
-    server.listen(0, () => resolve());
-    server.on('error', reject);
+    process.stderr.write(`[entry] ${err instanceof Error ? err.message : String(err)}\n`);
+    exitOnce(1);
   });
-
-  const addr = server.address();
-  if (!addr || typeof addr === 'string' || typeof addr.port !== 'number') {
-    throw new Error('bound address is not a TCP port address');
-  }
-
-  const port = addr.port;
-  process.stdout.write(`[entry] listening on port ${port}\n`);
-
-  await register(envUrl, port);
-  process.stdout.write('[entry] registered; waiting for the env to say done\n');
-
-  await waitForDone(envUrl);
-
-  await new Promise<void>((resolve, reject) => {
-    server.close((err) => {
-      if (err) reject(err);
-      else resolve();
-    });
+  proc.on('exit', (code) => {
+    exitOnce(code ?? 1);
   });
-
-  process.stdout.write('[entry] done\n');
-  process.exit(0);
 }
 
-main().catch((err) => {
-  const message = err instanceof Error ? err.message : String(err);
-  process.stderr.write(`[entry] ${message}\n`);
-  process.exit(1);
-});
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, () => {
+    if (child !== null) child.kill(sig);
+  });
+}
+
+launch(forgePath);
